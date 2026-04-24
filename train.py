@@ -5,7 +5,7 @@ Stage 1: Pre-train on VOC-FOG  (synthetic foggy, 9,578 train images)
 Stage 2: Fine-tune on RTTS     (real-world foggy, 4,322 images, 60/20/20)
 
 Architecture highlights:
-  - Base: YOLOv12-X pretrained weights (yolov12x.pt)
+  - Base: YOLO11-X pretrained weights (yolo11x.pt)
   - Preprocessing  → A2C2f-FSA (FFT frequency disentanglement + DSA)
   - Loss           → WIoU_v3_InnerMPDIoU (difficulty-adaptive weighting)
 
@@ -252,7 +252,7 @@ def stage1_vocfog(args, paths):
     print("=" * 55)
 
     common = build_common_args(args.batch)
-    model  = YOLO("yolov12x.pt")
+    model  = YOLO("yolo11x.pt")
     results = model.train(
         data    = str(VOCFOG_YAML),
         epochs  = args.s1_epochs,
@@ -277,7 +277,7 @@ def stage2_rtts(args, paths, init_weights: str = None):
     STAGE1_WEIGHTS = WEIGHTS_DIR / "said_vocfog_pretrained.pt"
 
     if init_weights is None:
-        init_weights = str(STAGE1_WEIGHTS) if STAGE1_WEIGHTS.exists() else "yolov12x.pt"
+        init_weights = str(STAGE1_WEIGHTS) if STAGE1_WEIGHTS.exists() else "yolo11x.pt"
     print(f"\nInitialising Stage 2 from: {init_weights}")
 
     print("\n" + "=" * 55)
