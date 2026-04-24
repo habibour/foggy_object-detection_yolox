@@ -32,3 +32,8 @@ env/
 
 # ── Jupyter checkpoints ───────────────────────────────────
 .ipynb_checkpoints/
+
+# ── Reference papers & temp files ──────────────────────
+*.pdf
+.tmp.driveupload/
+said_code.zip
