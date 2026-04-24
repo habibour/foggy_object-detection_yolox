@@ -1,0 +1,11 @@
+path: /Users/habibourakash/SWE/research/research_1/VOC_FOG_YOLO
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: person
+  1: bicycle
+  2: car
+  3: bus
+  4: motorbike
