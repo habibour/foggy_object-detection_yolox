@@ -1,0 +1,16 @@
+# VOC Clean Dataset — 5 classes (matching RTTS)
+# Update 'path' to point to your VOC dataset directory on Kaggle
+
+path: /kaggle/input/pascal-voc-2012  # ← UPDATE to your Kaggle VOC dataset path
+train: images/train
+val: images/val
+test: images/val
+
+# Only 5 classes matching RTTS (filter from VOC's 20 classes)
+nc: 5
+names:
+  0: person
+  1: bicycle
+  2: car
+  3: bus
+  4: motorbike

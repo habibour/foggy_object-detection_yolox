@@ -65,20 +65,20 @@ def auto_device() -> str:
 
 
 def get_paths(kaggle: bool = False):
-    """Return (ROOT, RTTS_YAML, VOCFOG_YAML, WEIGHTS_DIR, CKPT_DIR)."""
+    """Return (ROOT, RTTS_YAML, VOC_YAML, WEIGHTS_DIR, CKPT_DIR)."""
     if kaggle or IS_KAGGLE:
         ROOT = Path("/kaggle/working")
     else:
         ROOT = Path(__file__).parent
 
     RTTS_YAML   = ROOT / "rtts.yaml"
-    VOCFOG_YAML = ROOT / "vocfog.yaml"
+    VOC_YAML    = ROOT / "voc.yaml"       # clean VOC (5 classes)
     WEIGHTS_DIR = ROOT / "weights"
     CKPT_DIR    = ROOT / "checkpoints"
 
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
-    return ROOT, RTTS_YAML, VOCFOG_YAML, WEIGHTS_DIR, CKPT_DIR
+    return ROOT, RTTS_YAML, VOC_YAML, WEIGHTS_DIR, CKPT_DIR
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,13 +264,13 @@ def make_stability_callbacks(run_dir: Path, root: Path, target_map50: float = 0.
     }
 
 
-def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str, root: Path):
+def make_callbacks(args, run_dir: Path, rtts_yaml: str, voc_yaml: str, root: Path):
     """
     Custom eval + checkpoint callbacks for Stage 2.
 
     Schedule:
       - Val  every args.val_freq  epochs → RTTS val
-      - Test every args.test_freq epochs → RTTS test + VOC-FOG test
+      - Test every args.test_freq epochs → RTTS test + VOC test
       - Save rolling best every args.save_freq epochs (if mAP improved)
       - Publish .pt files to ROOT for Kaggle download
     """
@@ -359,12 +359,12 @@ def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str, root: 
             if row:
                 _maybe_save_best(epoch, row["map50"])
 
-        # ── Test every test_freq epochs (RTTS + VOC-FOG) ──────────────────
+        # ── Test every test_freq epochs (RTTS + VOC) ───────────────────────
         if epoch % args.test_freq == 0:
             print(f"\n{'─'*55}\n TEST @ epoch {epoch}\n{'─'*55}")
             _run_val("TEST-RTTS",   epoch, "test", rtts_yaml)
-            if Path(vocfog_yaml).exists():
-                _run_val("TEST-VOCFOG", epoch, "test", vocfog_yaml)
+            if Path(voc_yaml).exists():
+                _run_val("TEST-VOC", epoch, "test", voc_yaml)
 
     def on_train_end(trainer):
         epoch = trainer.epoch + 1
@@ -375,9 +375,9 @@ def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str, root: 
         _run_val("FINAL-VAL-RTTS",    epoch, "val",  rtts_yaml)
         print("\n Final RTTS test:")
         _run_val("FINAL-TEST-RTTS",   epoch, "test", rtts_yaml)
-        if Path(vocfog_yaml).exists():
-            print("\n Final VOC-FOG test:")
-            _run_val("FINAL-TEST-VOCFOG", epoch, "test", vocfog_yaml)
+        if Path(voc_yaml).exists():
+            print("\n Final VOC test:")
+            _run_val("FINAL-TEST-VOC", epoch, "test", voc_yaml)
 
         # Publish final weights
         best_pt = run_dir / "weights" / "best.pt"
@@ -411,51 +411,95 @@ def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str, root: 
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stage 1: Pre-train on VOC-FOG
+# Stage 1: Pre-train on CLEAN VOC (like the paper: VOC07+12)
 # ─────────────────────────────────────────────────────────────────────────────
-def stage1_vocfog(args, paths):
-    ROOT, RTTS_YAML, VOCFOG_YAML, WEIGHTS_DIR, CKPT_DIR = paths
-    STAGE1_WEIGHTS = WEIGHTS_DIR / "said_vocfog_pretrained.pt"
+def stage1_voc(args, paths):
+    """
+    Pre-train SAID model on clean VOC images (5 classes).
 
-    if not VOCFOG_YAML.exists():
-        raise FileNotFoundError(f"VOC-FOG config not found: {VOCFOG_YAML}")
+    Rationale (matching the paper):
+      - VOC has clear, high-quality images → teaches general object detection
+      - Same 5 classes as RTTS: person, bicycle, car, bus, motorbike
+      - No fog-specific augmentation needed (clean images)
+      - A2C2f-FSA learns neutral feature extraction on clean data
+      - Then fine-tuning on RTTS activates fog suppression
+    """
+    ROOT, RTTS_YAML, VOC_YAML, WEIGHTS_DIR, CKPT_DIR = paths
+    STAGE1_WEIGHTS = WEIGHTS_DIR / "said_voc_pretrained.pt"
+
+    if not VOC_YAML.exists():
+        raise FileNotFoundError(
+            f"VOC config not found: {VOC_YAML}\n"
+            f"Create voc.yaml with paths to your clean VOC dataset."
+        )
 
     print("\n" + "=" * 55)
-    print(" SAID — Stage 1: Pre-training on VOC-FOG")
+    print(" SAID — Stage 1: Pre-training on CLEAN VOC")
+    print(" (Matching paper: learn general detection on clear images)")
     print("=" * 55)
 
-    common = build_common_args(args.batch)
-
-    # Build SAID model: YOLO11x + A2C2f-FSA fog suppression
+    # Build SAID model: YOLO11x + A2C2f-FSA
     from said.integrate import create_said_yaml, register_a2c2f_fsa
     register_a2c2f_fsa()
     yaml_path = create_said_yaml(str(ROOT / "said_yolo11x.yaml"))
     model = YOLO(yaml_path)
     print(f"  SAID model: {sum(p.numel() for p in model.model.parameters()):,} params")
 
-    # Attach stability callbacks (gradient clipping + epoch-1 diagnostic save)
+    # Attach stability callbacks
     stab_cbs = make_stability_callbacks(
-        run_dir=ROOT / "runs" / "said" / "stage1_vocfog", root=ROOT
+        run_dir=ROOT / "runs" / "said" / "stage1_voc", root=ROOT,
+        target_map50=1.0,  # don't early-stop Stage 1
     )
     for event, fn in stab_cbs.items():
         model.add_callback(event, fn)
 
+    # Clean-image augmentation: standard, no fog-specific tricks
     results = model.train(
-        data    = str(VOCFOG_YAML),
-        epochs  = args.s1_epochs,
-        batch   = args.batch,
-        device  = args.device,
-        project = str(ROOT / "runs" / "said"),
-        name    = "stage1_vocfog",
-        exist_ok= True,
-        patience= 15,
-        **common,
+        data         = str(VOC_YAML),
+        epochs       = args.s1_epochs,
+        batch        = args.batch,
+        device       = args.device,
+        project      = str(ROOT / "runs" / "said"),
+        name         = "stage1_voc",
+        exist_ok     = True,
+        patience     = 15,
+        # Standard hyperparameters (no fog augmentation)
+        imgsz        = 640,
+        optimizer    = "AdamW",
+        lr0          = 0.002,        # higher LR OK for clean images
+        lrf          = 0.01,
+        weight_decay = 0.0005,
+        warmup_epochs= 3.0,
+        warmup_bias_lr= 0.01,
+        nbs          = 64,
+        # Standard augmentation (clean images — no fog simulation)
+        hsv_h        = 0.015,
+        hsv_s        = 0.7,
+        hsv_v        = 0.4,          # normal brightness variation
+        flipud       = 0.0,
+        fliplr       = 0.5,
+        mosaic       = 1.0,
+        mixup        = 0.15,
+        copy_paste   = 0.1,
+        degrees      = 0.0,
+        translate    = 0.1,
+        scale        = 0.5,
+        shear        = 0.0,
+        perspective  = 0.0,
+        close_mosaic = 10,
+        amp          = True,
+        workers      = 4,
+        plots        = True,
+        verbose      = True,
+        val          = True,
+        save         = True,
+        save_period  = 10,
     )
 
     # Publish Stage 1 weights
     best = Path(results.save_dir) / "weights" / "best.pt"
     shutil.copy2(best, STAGE1_WEIGHTS)
-    publish_weights(best, "said_stage1_best.pt", ROOT)
+    publish_weights(best, "said_stage1_voc_best.pt", ROOT)
     print(f"\nStage 1 complete → {STAGE1_WEIGHTS}")
     return str(STAGE1_WEIGHTS)
 
@@ -464,8 +508,8 @@ def stage1_vocfog(args, paths):
 # Stage 2: Fine-tune on RTTS
 # ─────────────────────────────────────────────────────────────────────────────
 def stage2_rtts(args, paths, init_weights: str = None):
-    ROOT, RTTS_YAML, VOCFOG_YAML, WEIGHTS_DIR, CKPT_DIR = paths
-    STAGE1_WEIGHTS = WEIGHTS_DIR / "said_vocfog_pretrained.pt"
+    ROOT, RTTS_YAML, VOC_YAML, WEIGHTS_DIR, CKPT_DIR = paths
+    STAGE1_WEIGHTS = WEIGHTS_DIR / "said_voc_pretrained.pt"
 
     # ── Handle resume ─────────────────────────────────────────────────────
     if args.resume:
@@ -598,7 +642,7 @@ def stage2_rtts(args, paths, init_weights: str = None):
     # Eval + checkpoint callbacks
     callbacks = make_callbacks(
         args=args, run_dir=run_dir,
-        rtts_yaml=str(RTTS_YAML), vocfog_yaml=str(VOCFOG_YAML),
+        rtts_yaml=str(RTTS_YAML), voc_yaml=str(VOC_YAML),
         root=ROOT,
     )
     for event, fn in callbacks.items():
@@ -699,12 +743,12 @@ def sanity_check():
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
     p = argparse.ArgumentParser(description="SAID Training Script")
-    p.add_argument("--stage",     choices=["vocfog","rtts","both","validate","check"],
+    p.add_argument("--stage",     choices=["voc","rtts","both","validate","check"],
                    default="both")
     p.add_argument("--epochs",    type=int, default=100,
-                   help="Stage 2 Phase 2b epochs")
+                   help="Stage 2 total epochs (Phase 2a + 2b)")
     p.add_argument("--s1-epochs", type=int, default=50,
-                   help="Stage 1 VOC-FOG pre-training epochs")
+                   help="Stage 1 clean VOC pre-training epochs")
     p.add_argument("--batch",     type=int, default=None,
                    help="Physical batch size (default: 4, effective 64 via grad accum)")
     p.add_argument("--device",    type=str, default=None,
@@ -718,7 +762,7 @@ def parse_args():
     p.add_argument("--val-freq",  type=int, default=10,
                    help="Validate every N epochs (default: 10)")
     p.add_argument("--test-freq", type=int, default=20,
-                   help="Test every N epochs on RTTS+VOC-FOG (default: 20)")
+                   help="Test every N epochs on RTTS+VOC (default: 20)")
     p.add_argument("--save-freq", type=int, default=5,
                    help="Save rolling best every N epochs (default: 5)")
     p.add_argument("--target-map", type=float, default=0.93,
@@ -770,8 +814,8 @@ def main():
         return
 
     stage1_weights = None
-    if args.stage in ("vocfog", "both"):
-        stage1_weights = stage1_vocfog(args, paths)
+    if args.stage in ("voc", "both"):
+        stage1_weights = stage1_voc(args, paths)
 
     if args.stage in ("rtts", "both"):
         stage2_rtts(args, paths, init_weights=stage1_weights)
