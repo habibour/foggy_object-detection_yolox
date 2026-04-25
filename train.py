@@ -80,7 +80,7 @@ def build_common_args(batch: int, workers: int = 4) -> dict:
     return dict(
         imgsz         = 640,
         optimizer     = "AdamW",
-        lr0           = 0.01,
+        lr0           = 0.002,
         lrf           = 0.01,
         weight_decay  = 0.0005,
         warmup_epochs = 3.0,
@@ -122,8 +122,10 @@ def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str):
       - Save rolling best every args.save_freq epochs (if mAP improved)
       - Save final weights on training end
     """
-    WEIGHTS_DIR = run_dir.parent.parent / "weights"
-    CKPT_DIR    = run_dir.parent.parent / "checkpoints"
+    # run_dir = ROOT/runs/said/stage2b_full → parent.parent.parent = ROOT
+    ROOT_DIR    = run_dir.parent.parent.parent
+    WEIGHTS_DIR = ROOT_DIR / "weights"
+    CKPT_DIR    = ROOT_DIR / "checkpoints"
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -294,6 +296,7 @@ def stage2_rtts(args, paths, init_weights: str = None):
         device       = args.device,
         project      = str(ROOT / "runs" / "said"),
         name         = "stage2a_freeze",
+        exist_ok     = True,
         freeze       = list(range(10)),
         lr0          = 0.001,
         lrf          = 0.1,
@@ -310,10 +313,18 @@ def stage2_rtts(args, paths, init_weights: str = None):
         verbose      = True,
     )
 
+    # Ultralytics may append -N suffix (stage2a_freeze-2, etc.)
     phase2a_best = ROOT / "runs" / "said" / "stage2a_freeze" / "weights" / "best.pt"
     if not phase2a_best.exists():
-        print(f"  Warning: phase2a best not found, using {init_weights}")
-        phase2a_best = Path(init_weights)
+        # Search for any stage2a_freeze* directory
+        import glob
+        candidates = sorted(glob.glob(str(ROOT / "runs" / "said" / "stage2a_freeze*" / "weights" / "best.pt")))
+        if candidates:
+            phase2a_best = Path(candidates[-1])  # use the latest
+            print(f"  Found phase2a best at: {phase2a_best}")
+        else:
+            print(f"  Warning: phase2a best not found, using {init_weights}")
+            phase2a_best = Path(init_weights)
 
     # ── Phase 2b: Full fine-tune with custom callbacks ─────────────────────
     print("\n[Phase 2b] Full fine-tune on RTTS with custom eval schedule")
@@ -333,13 +344,14 @@ def stage2_rtts(args, paths, init_weights: str = None):
         model_b.add_callback(event, fn)
 
     model_b.train(
-        data    = str(RTTS_YAML),
-        epochs  = args.epochs,
-        batch   = args.batch,
-        device  = args.device,
-        project = str(ROOT / "runs" / "said"),
-        name    = run_name,
-        patience= 0,                   # we manage checkpoints via callbacks
+        data     = str(RTTS_YAML),
+        epochs   = args.epochs,
+        batch    = args.batch,
+        device   = args.device,
+        project  = str(ROOT / "runs" / "said"),
+        name     = run_name,
+        exist_ok = True,
+        patience = 0,                   # we manage checkpoints via callbacks
         **{**common, "val": False},    # disable default per-epoch val
     )
     print(f"\nStage 2 complete.")
@@ -350,10 +362,26 @@ def stage2_rtts(args, paths, init_weights: str = None):
 # ─────────────────────────────────────────────────────────────────────────────
 def validate(args, paths):
     ROOT, RTTS_YAML, VOCFOG_YAML, WEIGHTS_DIR, _ = paths
-    weights = args.weights or str(WEIGHTS_DIR / "said_rtts_final.pt")
-    if not Path(weights).exists():
-        print(f"Weights not found: {weights}")
+    # Check multiple possible weight locations
+    candidates = [
+        args.weights,
+        str(WEIGHTS_DIR / "said_rtts_final.pt"),
+        str(ROOT / "runs" / "weights" / "said_rtts_final.pt"),
+        str(ROOT / "checkpoints" / "said_rolling_best.pt"),
+        str(ROOT / "runs" / "said" / "stage2b_full" / "weights" / "best.pt"),
+    ]
+    weights = None
+    for c in candidates:
+        if c and Path(c).exists():
+            weights = c
+            break
+    if weights is None:
+        print(f"Weights not found. Searched:")
+        for c in candidates:
+            if c:
+                print(f"  ✗ {c}")
         return
+    print(f"Using weights: {weights}")
 
     print(f"\n{'═'*55}\n SAID — Final Evaluation\n{'═'*55}")
     model = YOLO(weights)
@@ -435,7 +463,7 @@ def main():
     if args.device is None:
         args.device = auto_device()
     if args.batch is None:
-        args.batch = 32 if (kaggle or args.device == "0") else 16
+        args.batch = 16  # P100 16GB can't handle batch=32 with YOLO11x + augmentation
 
     print(f"\n{'═'*55}")
     print(f" SAID Training Configuration")
