@@ -84,8 +84,8 @@ def parse_voc_xml(xml_path: str) -> list:
     return objects, w, h
 
 
-def convert_voc_to_yolo(voc_dir: str, out_dir: str, val_ratio: float = 0.2,
-                         seed: int = 42):
+def convert_voc_to_yolo(voc_dir: str, out_dir: str, val_ratio: float = 0.15,
+                         test_ratio: float = 0.15, seed: int = 42):
     """
     Convert VOC dataset to YOLO format, keeping only RTTS 5 classes.
 
@@ -124,7 +124,7 @@ def convert_voc_to_yolo(voc_dir: str, out_dir: str, val_ratio: float = 0.2,
         print(f"  {d}")
 
     # Create output dirs
-    for split in ['train', 'val']:
+    for split in ['train', 'val', 'test']:
         (out_dir / 'images' / split).mkdir(parents=True, exist_ok=True)
         (out_dir / 'labels' / split).mkdir(parents=True, exist_ok=True)
 
@@ -158,20 +158,23 @@ def convert_voc_to_yolo(voc_dir: str, out_dir: str, val_ratio: float = 0.2,
     print(f"\nTotal images with RTTS classes: {len(valid_samples)}")
     print(f"Skipped (no matching classes):  {skipped}")
 
-    # Split train/val
+    # Split train/val/test
     random.seed(seed)
     random.shuffle(valid_samples)
     n_val = int(len(valid_samples) * val_ratio)
+    n_test = int(len(valid_samples) * test_ratio)
     val_samples = valid_samples[:n_val]
-    train_samples = valid_samples[n_val:]
+    test_samples = valid_samples[n_val:n_val + n_test]
+    train_samples = valid_samples[n_val + n_test:]
 
     print(f"Train: {len(train_samples)}")
     print(f"Val:   {len(val_samples)}")
+    print(f"Test:  {len(test_samples)}")
 
     # Write files
     class_counts = {name: 0 for name in RTTS_CLASSES}
 
-    for split, samples in [('train', train_samples), ('val', val_samples)]:
+    for split, samples in [('train', train_samples), ('val', val_samples), ('test', test_samples)]:
         for xml_path, img_path, objects in samples:
             stem = img_path.stem
             dst_img = out_dir / 'images' / split / img_path.name
@@ -200,7 +203,7 @@ def convert_voc_to_yolo(voc_dir: str, out_dir: str, val_ratio: float = 0.2,
 path: {out_dir}
 train: images/train
 val: images/val
-test: images/val
+test: images/test
 
 nc: 5
 names:
@@ -222,11 +225,13 @@ if __name__ == '__main__':
                         help='Path to VOCdevkit or VOC directory')
     parser.add_argument('--out-dir', type=str, default=None,
                         help='Output directory (default: VOC_YOLO/ next to voc-dir)')
-    parser.add_argument('--val-ratio', type=float, default=0.2,
-                        help='Validation split ratio (default: 0.2)')
+    parser.add_argument('--val-ratio', type=float, default=0.15,
+                        help='Validation split ratio (default: 0.15)')
+    parser.add_argument('--test-ratio', type=float, default=0.15,
+                        help='Test split ratio (default: 0.15)')
     args = parser.parse_args()
 
     if args.out_dir is None:
         args.out_dir = str(Path(args.voc_dir).parent / 'VOC_YOLO')
 
-    convert_voc_to_yolo(args.voc_dir, args.out_dir, args.val_ratio)
+    convert_voc_to_yolo(args.voc_dir, args.out_dir, args.val_ratio, args.test_ratio)
