@@ -86,49 +86,69 @@ def get_paths(kaggle: bool = False):
 # ─────────────────────────────────────────────────────────────────────────────
 def build_common_args(batch: int, workers: int = 4) -> dict:
     """
-    Shared training hyperparameters.
+    Shared training hyperparameters with FOG-AWARE augmentation.
 
-    Memory strategy for P100 (16GB):
-      - Physical batch = 4 (fits in VRAM with YOLO11x + augmentation)
-      - nbs = 64 (nominal batch size → gradient accumulated over 64/4 = 16 steps)
-      - This gives effective batch 64 with only 4 images per GPU forward pass
+    Fog-Aware Augmentation Strategy:
+      Instead of CLAHE preprocessing (adds latency, not GPU-native), we
+      simulate contrast enhancement via high hsv_v (0.6) and hsv_s (0.8).
+      This forces the model to learn from images with varied contrast/
+      saturation, mimicking what CLAHE would produce.
 
-    Stability:
-      - lr0 = 0.001 (conservative to prevent EMA NaN/Inf)
-      - warmup_epochs = 5.0 (longer warmup for stable gradient scaling)
-      - max_norm gradient clipping handled by ultralytics internally
+    Memory: Physical batch=4, nbs=64 → 16x grad accumulation → effective 64.
     """
     return dict(
         imgsz         = 640,
         optimizer     = "AdamW",
-        lr0           = 0.001,       # conservative LR to prevent EMA NaN
+        lr0           = 0.001,
         lrf           = 0.01,
         weight_decay  = 0.0005,
-        warmup_epochs = 5.0,         # longer warmup for gradient stability
-        warmup_bias_lr= 0.01,        # lower bias warmup LR
-        nbs           = 64,          # nominal batch size → grad accum = 64/batch
+        warmup_epochs = 3.0,
+        warmup_bias_lr= 0.01,
+        nbs           = 64,
+        # ── Fog-Aware Augmentation ─────────────────────────────────────
+        # High hsv_v (0.6): simulates CLAHE — forces varied brightness
+        # High hsv_s (0.8): varied saturation combats fog desaturation
+        # High scale (0.9): multi-scale training for distance-fog objects
+        # erasing (0.3): simulates partial occlusion by dense fog patches
         hsv_h         = 0.015,
-        hsv_s         = 0.7,
-        hsv_v         = 0.4,
+        hsv_s         = 0.8,         # high: combats fog desaturation
+        hsv_v         = 0.6,         # high: simulates CLAHE contrast var
         flipud        = 0.0,
         fliplr        = 0.5,
         mosaic        = 1.0,
         mixup         = 0.15,
         copy_paste    = 0.1,
+        erasing       = 0.3,         # random erasing → fog patch simulation
         degrees       = 0.0,
-        translate     = 0.1,
-        scale         = 0.5,
+        translate     = 0.2,         # higher translate for position variety
+        scale         = 0.9,         # aggressive multi-scale for fog depth
         shear         = 0.0,
         perspective   = 0.0,
         close_mosaic  = 10,
-        amp           = True,        # FP16 mixed precision
+        amp           = True,
         workers       = workers,
         plots         = True,
         verbose       = True,
         val           = True,
         save          = True,
-        save_period   = 10,          # save checkpoint every 10 epochs
+        save_period   = 10,
     )
+
+
+def build_phase2b_args(batch: int, workers: int = 4) -> dict:
+    """
+    Phase 2b args: full fine-tune with cosine LR for smooth convergence.
+    cos_lr=True gives better final mAP than linear LR decay.
+    """
+    base = build_common_args(batch, workers)
+    base.update(
+        lr0           = 0.001,
+        lrf           = 0.001,       # cosine decays to lr0 * lrf = 1e-6
+        cos_lr        = True,        # cosine annealing schedule
+        warmup_epochs = 3.0,
+        close_mosaic  = 5,           # disable augmentation earlier for fine-tune
+    )
+    return base
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,38 +167,96 @@ def publish_weights(src: Path, name: str, root: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 # Callback Factory for Stage 2
 # ─────────────────────────────────────────────────────────────────────────────
-def make_stability_callbacks(run_dir: Path, root: Path):
+def make_stability_callbacks(run_dir: Path, root: Path, target_map50: float = 0.93):
     """
-    Callbacks for gradient clipping and forced first-epoch checkpoint.
-    Prevents EMA NaN/Inf and ensures diagnostic checkpoint is always available.
+    Callbacks for:
+    1. Gradient clipping (max_norm=10) after each batch
+    2. Forced epoch-1 diagnostic checkpoint
+    3. Custom fitness function: 0.9*mAP50 + 0.1*mAP50-95
+    4. Early stopping at target_map50 (default 93%)
     """
     import torch
 
+    fitness_state = {
+        "best_fitness": 0.0,
+        "best_epoch": 0,
+        "patience_counter": 0,
+        "target_reached": False,
+    }
+
     def on_train_batch_end(trainer):
         """Apply gradient clipping after each batch to prevent NaN gradients."""
-        if trainer.model is not None and trainer.model.parameters():
+        if trainer.model is not None:
             torch.nn.utils.clip_grad_norm_(
                 trainer.model.parameters(), max_norm=10.0
             )
 
     def on_fit_epoch_end_stability(trainer):
-        """Force-save epoch 1 checkpoint regardless of EMA status."""
+        """Epoch-1 save + custom fitness + early stopping."""
         epoch = trainer.epoch + 1
+
+        # ── Force save epoch 1 diagnostic ────────────────────────────────
         if epoch == 1:
             save_dir = Path(trainer.save_dir) / "weights"
             save_dir.mkdir(parents=True, exist_ok=True)
             ckpt_path = save_dir / "epoch1_diagnostic.pt"
             try:
-                # Save model state dict directly (bypasses EMA check)
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': trainer.model.state_dict(),
                     'optimizer_state_dict': trainer.optimizer.state_dict() if trainer.optimizer else None,
                 }, str(ckpt_path))
-                print(f"  💾 Epoch 1 diagnostic checkpoint saved: {ckpt_path.name}")
+                print(f"  \U0001f4be Epoch 1 diagnostic saved: {ckpt_path.name}")
                 publish_weights(ckpt_path, "said_epoch1_diagnostic.pt", root)
             except Exception as e:
-                print(f"  ⚠ Epoch 1 save failed: {e}")
+                print(f"  \u26a0 Epoch 1 save failed: {e}")
+
+        # ── Custom fitness: 0.9*mAP50 + 0.1*mAP50-95 ────────────────────
+        if hasattr(trainer, 'metrics') and trainer.metrics:
+            try:
+                map50 = trainer.metrics.get('metrics/mAP50(B)', 0)
+                map50_95 = trainer.metrics.get('metrics/mAP50-95(B)', 0)
+                fitness = 0.9 * map50 + 0.1 * map50_95
+
+                if fitness > 0:
+                    print(
+                        f"  \U0001f4ca Fitness={fitness:.4f} "
+                        f"(mAP50={map50:.4f}, mAP50-95={map50_95:.4f}) "
+                        f"| best={fitness_state['best_fitness']:.4f}"
+                    )
+
+                    if fitness > fitness_state["best_fitness"]:
+                        fitness_state["best_fitness"] = fitness
+                        fitness_state["best_epoch"] = epoch
+                        fitness_state["patience_counter"] = 0
+                    else:
+                        fitness_state["patience_counter"] += 1
+
+                    # ── Early stop: target reached ───────────────────────
+                    if map50 >= target_map50:
+                        fitness_state["target_reached"] = True
+                        print(
+                            f"\n  \U0001f3af TARGET REACHED! mAP50={map50:.4f} >= {target_map50} "
+                            f"@ epoch {epoch}"
+                        )
+                        print(f"  Saving best weights and stopping...")
+                        # Force save
+                        last_pt = Path(trainer.save_dir) / "weights" / "last.pt"
+                        if last_pt.exists():
+                            publish_weights(last_pt, "said_target_reached.pt", root)
+                        trainer.stop = True  # signal ultralytics to stop
+
+                    # ── Early stop: patience exhausted ───────────────────
+                    if fitness_state["patience_counter"] >= 10:
+                        print(
+                            f"\n  \u23f9 EARLY STOP: no improvement for 10 epochs "
+                            f"(best fitness={fitness_state['best_fitness']:.4f} "
+                            f"@ epoch {fitness_state['best_epoch']})"
+                        )
+                        trainer.stop = True
+
+            except Exception:
+                pass  # metrics not available yet
 
     return {
         "on_train_batch_end": on_train_batch_end,
@@ -433,7 +511,6 @@ def stage2_rtts(args, paths, init_weights: str = None):
         if STAGE1_WEIGHTS.exists():
             init_weights = str(STAGE1_WEIGHTS)
         else:
-            # Build SAID model from scratch if no Stage 1 weights
             from said.integrate import create_said_yaml, register_a2c2f_fsa
             register_a2c2f_fsa()
             init_weights = create_said_yaml(str(ROOT / "said_yolo11x.yaml"))
@@ -443,26 +520,45 @@ def stage2_rtts(args, paths, init_weights: str = None):
     print(" SAID — Stage 2: Fine-tuning on RTTS")
     print("=" * 55)
 
-    # ── Phase 2a: Freeze backbone (10 epochs) ─────────────────────────────
-    print("\n[Phase 2a] Backbone frozen — head warmup on RTTS (10 epochs)")
+    # ── Phase 2a: Freeze backbone (15 epochs) ─────────────────────────────
+    # Freezes layers 0-9 (backbone) to stabilize detection heads first.
+    # Uses higher LR for unfrozen head layers with linear schedule.
+    freeze_epochs = 15
+    print(f"\n[Phase 2a] Backbone frozen (layers 0-9) — {freeze_epochs} epochs")
     model_a = YOLO(init_weights)
+
+    # Attach stability callbacks to Phase 2a too
+    stab_2a = make_stability_callbacks(
+        run_dir=ROOT / "runs" / "said" / "stage2a_freeze", root=ROOT,
+        target_map50=args.target_map,
+    )
+    for event, fn in stab_2a.items():
+        model_a.add_callback(event, fn)
+
     model_a.train(
         data         = str(RTTS_YAML),
-        epochs       = 10,
+        epochs       = freeze_epochs,
         batch        = args.batch,
         device       = args.device,
         project      = str(ROOT / "runs" / "said"),
         name         = "stage2a_freeze",
         exist_ok     = True,
-        freeze       = list(range(10)),
-        lr0          = 0.0005,
+        freeze       = list(range(10)),   # freeze backbone layers 0-9
+        lr0          = 0.005,             # higher LR for head-only training
         lrf          = 0.1,
         weight_decay = 0.0005,
         warmup_epochs= 2.0,
         nbs          = 64,
         imgsz        = 640,
         optimizer    = "AdamW",
+        # Fog-aware augmentation (lighter for warmup)
+        hsv_h        = 0.015,
+        hsv_s        = 0.7,
+        hsv_v        = 0.5,              # moderate CLAHE simulation
         mosaic       = 0.8,
+        mixup        = 0.1,
+        erasing      = 0.2,
+        scale        = 0.5,
         amp          = True,
         workers      = 4,
         val          = True,
@@ -472,7 +568,7 @@ def stage2_rtts(args, paths, init_weights: str = None):
         verbose      = True,
     )
 
-    # Ultralytics may append -N suffix (stage2a_freeze-2, etc.)
+    # Find phase2a best weights
     phase2a_best = ROOT / "runs" / "said" / "stage2a_freeze" / "weights" / "best.pt"
     if not phase2a_best.exists():
         candidates = sorted(glob.glob(str(ROOT / "runs" / "said" / "stage2a_freeze*" / "weights" / "best.pt")))
@@ -485,14 +581,21 @@ def stage2_rtts(args, paths, init_weights: str = None):
 
     publish_weights(phase2a_best, "said_stage2a_best.pt", ROOT)
 
-    # ── Phase 2b: Full fine-tune with custom callbacks ─────────────────────
-    print("\n[Phase 2b] Full fine-tune on RTTS with custom eval schedule")
+    # ── Phase 2b: Full fine-tune with cosine LR ───────────────────────────
+    # Unfreezes all layers, uses cos_lr for smooth convergence.
+    # Custom fitness (0.9*mAP50 + 0.1*mAP50-95) with patience=10.
+    remaining_epochs = max(args.epochs - freeze_epochs, 35)
+    print(f"\n[Phase 2b] Full fine-tune with cos_lr — {remaining_epochs} epochs")
+    print(f"  Fitness: 0.9*mAP50 + 0.1*mAP50-95")
+    print(f"  Early stop: patience=10 or mAP50 >= {args.target_map}")
+
     run_name = "stage2b_full"
     run_dir  = ROOT / "runs" / "said" / run_name
 
-    common  = build_common_args(args.batch)
+    phase2b_args = build_phase2b_args(args.batch)
     model_b = YOLO(str(phase2a_best))
 
+    # Eval + checkpoint callbacks
     callbacks = make_callbacks(
         args=args, run_dir=run_dir,
         rtts_yaml=str(RTTS_YAML), vocfog_yaml=str(VOCFOG_YAML),
@@ -501,21 +604,23 @@ def stage2_rtts(args, paths, init_weights: str = None):
     for event, fn in callbacks.items():
         model_b.add_callback(event, fn)
 
-    # Stability callbacks (gradient clipping + epoch-1 save)
-    stab_cbs = make_stability_callbacks(run_dir=run_dir, root=ROOT)
+    # Stability + fitness + early stopping callbacks
+    stab_cbs = make_stability_callbacks(
+        run_dir=run_dir, root=ROOT, target_map50=args.target_map,
+    )
     for event, fn in stab_cbs.items():
         model_b.add_callback(event, fn)
 
     model_b.train(
         data     = str(RTTS_YAML),
-        epochs   = args.epochs,
+        epochs   = remaining_epochs,
         batch    = args.batch,
         device   = args.device,
         project  = str(ROOT / "runs" / "said"),
         name     = run_name,
         exist_ok = True,
-        patience = 0,
-        **{**common, "val": False},
+        patience = 0,            # we handle early stopping in our callback
+        **{**phase2b_args, "val": True},  # enable val for fitness tracking
     )
     print(f"\nStage 2 complete.")
 
@@ -616,6 +721,8 @@ def parse_args():
                    help="Test every N epochs on RTTS+VOC-FOG (default: 20)")
     p.add_argument("--save-freq", type=int, default=5,
                    help="Save rolling best every N epochs (default: 5)")
+    p.add_argument("--target-map", type=float, default=0.93,
+                   help="Target mAP50 for early stopping (default: 0.93)")
     return p.parse_args()
 
 
@@ -641,6 +748,7 @@ def main():
     print(f"  Val every   : {args.val_freq} epochs")
     print(f"  Test every  : {args.test_freq} epochs")
     print(f"  Save best   : every {args.save_freq} epochs")
+    print(f"  Target mAP50: {args.target_map} (early stop)")
     if args.resume:
         print(f"  Resume from : {args.resume}")
     print(f"{'═'*55}\n")
