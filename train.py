@@ -9,23 +9,25 @@ Architecture highlights:
   - Preprocessing  → A2C2f-FSA (FFT frequency disentanglement + DSA)
   - Loss           → WIoU_v3_InnerMPDIoU (difficulty-adaptive weighting)
 
-Custom Evaluation & Checkpoint Schedule (Stage 2):
-  - Validation   : every 10 epochs  (RTTS val split)
-  - Test         : every 20 epochs  (RTTS test + VOC-FOG test)
-  - Best save    : every  5 epochs  (replaces rolling best if mAP improved)
-  - Final save   : on training end  (always saved)
+Checkpoint & Evaluation Schedule:
+  - Both stages  : checkpoint saved every 10 epochs + best.pt + last.pt
+  - Stage 2 val  : every 10 epochs on RTTS val
+  - Stage 2 test : every 20 epochs on RTTS test + VOC-FOG test
+  - Rolling best : every 5 epochs (replaces if mAP improved)
+  - All .pt files saved to /kaggle/working/ for easy download
 
-Usage (local):
-    python train.py --stage both
-    python train.py --stage rtts
-    python train.py --stage validate
+Resume training:
+    python train.py --stage rtts --resume /path/to/last.pt --kaggle
 
-Usage (Kaggle P100 — auto-detected):
+Usage:
     python train.py --stage both --kaggle
+    python train.py --stage rtts --epochs 100 --kaggle
+    python train.py --stage validate --kaggle
 """
 
 import argparse
 import csv
+import glob
 import json
 import os
 import shutil
@@ -45,9 +47,9 @@ def auto_device() -> str:
     try:
         import torch
         if torch.cuda.is_available():
-            return "0"               # CUDA (Kaggle P100 / any NVIDIA)
+            return "0"
         if torch.backends.mps.is_available():
-            return "mps"             # Apple Silicon
+            return "mps"
     except Exception:
         pass
     return "cpu"
@@ -56,17 +58,14 @@ def auto_device() -> str:
 def get_paths(kaggle: bool = False):
     """Return (ROOT, RTTS_YAML, VOCFOG_YAML, WEIGHTS_DIR, CKPT_DIR)."""
     if kaggle or IS_KAGGLE:
-        ROOT        = Path("/kaggle/working")
-        RTTS_YAML   = ROOT / "rtts.yaml"
-        VOCFOG_YAML = ROOT / "vocfog.yaml"
-        WEIGHTS_DIR = ROOT / "weights"
-        CKPT_DIR    = ROOT / "checkpoints"
+        ROOT = Path("/kaggle/working")
     else:
-        ROOT        = Path(__file__).parent
-        RTTS_YAML   = ROOT / "rtts.yaml"
-        VOCFOG_YAML = ROOT / "vocfog.yaml"
-        WEIGHTS_DIR = ROOT / "weights"
-        CKPT_DIR    = ROOT / "checkpoints"
+        ROOT = Path(__file__).parent
+
+    RTTS_YAML   = ROOT / "rtts.yaml"
+    VOCFOG_YAML = ROOT / "vocfog.yaml"
+    WEIGHTS_DIR = ROOT / "weights"
+    CKPT_DIR    = ROOT / "checkpoints"
 
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
@@ -74,7 +73,7 @@ def get_paths(kaggle: bool = False):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hyperparameters (shared base — overridden per stage below)
+# Hyperparameters
 # ─────────────────────────────────────────────────────────────────────────────
 def build_common_args(batch: int, workers: int = 4) -> dict:
     return dict(
@@ -99,33 +98,44 @@ def build_common_args(batch: int, workers: int = 4) -> dict:
         shear         = 0.0,
         perspective   = 0.0,
         close_mosaic  = 10,
-        amp           = True,       # FP16 mixed precision (P100 ~2× speedup)
+        amp           = True,
         workers       = workers,
         plots         = True,
         verbose       = True,
         val           = True,
         save          = True,
-        save_period   = -1,         # we handle checkpointing via callbacks
+        save_period   = 10,          # save checkpoint every 10 epochs
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Callback Factory
+# Helper: copy checkpoints to /kaggle/working/ for download
 # ─────────────────────────────────────────────────────────────────────────────
-def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str):
+def publish_weights(src: Path, name: str, root: Path):
+    """Copy a .pt file to ROOT (e.g. /kaggle/working/) for easy download."""
+    dest = root / name
+    if src.exists():
+        shutil.copy2(src, dest)
+        size_mb = dest.stat().st_size / 1e6
+        print(f"  📦 {name} ({size_mb:.1f} MB) → {dest}")
+    return dest
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback Factory for Stage 2
+# ─────────────────────────────────────────────────────────────────────────────
+def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str, root: Path):
     """
-    Custom eval + checkpoint callbacks for Stage 2 Phase 2b.
+    Custom eval + checkpoint callbacks for Stage 2.
 
     Schedule:
-      - Val  every args.val_freq  epochs  → RTTS val
-      - Test every args.test_freq epochs  → RTTS test + VOC-FOG test
+      - Val  every args.val_freq  epochs → RTTS val
+      - Test every args.test_freq epochs → RTTS test + VOC-FOG test
       - Save rolling best every args.save_freq epochs (if mAP improved)
-      - Save final weights on training end
+      - Publish .pt files to ROOT for Kaggle download
     """
-    # run_dir = ROOT/runs/said/stage2b_full → parent.parent.parent = ROOT
-    ROOT_DIR    = run_dir.parent.parent.parent
-    WEIGHTS_DIR = ROOT_DIR / "weights"
-    CKPT_DIR    = ROOT_DIR / "checkpoints"
+    WEIGHTS_DIR = root / "weights"
+    CKPT_DIR    = root / "checkpoints"
     WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -178,13 +188,29 @@ def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str):
             last_pt = run_dir / "weights" / "last.pt"
             if last_pt.exists():
                 shutil.copy2(last_pt, ROLLING_BEST)
+                # Also publish to ROOT for download
+                publish_weights(last_pt, "said_best.pt", root)
                 print(
                     f"  ★ Rolling best updated: mAP50={map50:.4f} "
-                    f"@ epoch {epoch} → {ROLLING_BEST.name}"
+                    f"@ epoch {epoch}"
                 )
 
     def on_fit_epoch_end(trainer):
         epoch = trainer.epoch + 1
+
+        # ── Always publish last.pt for crash recovery ─────────────────────
+        last_pt = run_dir / "weights" / "last.pt"
+        if last_pt.exists():
+            publish_weights(last_pt, "said_last.pt", root)
+
+        # ── Publish periodic checkpoints (epoch_N.pt) every 10 epochs ─────
+        if epoch % 10 == 0:
+            epoch_pt = run_dir / "weights" / f"epoch{epoch}.pt"
+            if epoch_pt.exists():
+                publish_weights(epoch_pt, f"said_epoch{epoch}.pt", root)
+            # Also copy last.pt as a named checkpoint
+            if last_pt.exists():
+                publish_weights(last_pt, f"said_epoch{epoch}.pt", root)
 
         # ── Validation every val_freq epochs ──────────────────────────────
         if epoch % args.val_freq == 0:
@@ -213,16 +239,14 @@ def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str):
             print("\n Final VOC-FOG test:")
             _run_val("FINAL-TEST-VOCFOG", epoch, "test", vocfog_yaml)
 
-        # Save final weights
+        # Publish final weights
         best_pt = run_dir / "weights" / "best.pt"
         last_pt = run_dir / "weights" / "last.pt"
         if best_pt.exists():
             shutil.copy2(best_pt, STAGE2_WEIGHTS)
-            print(f"\n  ✓ Final (best.pt)  → {STAGE2_WEIGHTS}")
+            publish_weights(best_pt, "said_final_best.pt", root)
         if last_pt.exists():
-            last_final = WEIGHTS_DIR / "said_rtts_last.pt"
-            shutil.copy2(last_pt, last_final)
-            print(f"  ✓ Final (last.pt)  → {last_final}")
+            publish_weights(last_pt, "said_final_last.pt", root)
 
         # Summary JSON
         summary = {
@@ -232,9 +256,16 @@ def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str):
             "final_weights":      str(STAGE2_WEIGHTS),
             "eval_log":           str(LOG_PATH),
         }
-        (run_dir / "said_summary.json").write_text(json.dumps(summary, indent=2))
+        summary_path = root / "said_summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2))
         print(f"\n  Rolling best: mAP50={state['best_map50']:.4f} @ ep{state['best_epoch']}")
         print(f"  Eval log    : {LOG_PATH}")
+        print(f"  Summary     : {summary_path}")
+
+        # List all downloadable files
+        print(f"\n{'─'*55}\n Downloadable files in {root}:\n{'─'*55}")
+        for f in sorted(root.glob("said_*.pt")):
+            print(f"  📦 {f.name}  ({f.stat().st_size/1e6:.1f} MB)")
 
     return {"on_fit_epoch_end": on_fit_epoch_end, "on_train_end": on_train_end}
 
@@ -262,11 +293,15 @@ def stage1_vocfog(args, paths):
         device  = args.device,
         project = str(ROOT / "runs" / "said"),
         name    = "stage1_vocfog",
+        exist_ok= True,
         patience= 15,
         **common,
     )
+
+    # Publish Stage 1 weights
     best = Path(results.save_dir) / "weights" / "best.pt"
     shutil.copy2(best, STAGE1_WEIGHTS)
+    publish_weights(best, "said_stage1_best.pt", ROOT)
     print(f"\nStage 1 complete → {STAGE1_WEIGHTS}")
     return str(STAGE1_WEIGHTS)
 
@@ -278,6 +313,46 @@ def stage2_rtts(args, paths, init_weights: str = None):
     ROOT, RTTS_YAML, VOCFOG_YAML, WEIGHTS_DIR, CKPT_DIR = paths
     STAGE1_WEIGHTS = WEIGHTS_DIR / "said_vocfog_pretrained.pt"
 
+    # ── Handle resume ─────────────────────────────────────────────────────
+    if args.resume:
+        resume_pt = Path(args.resume)
+        if not resume_pt.exists():
+            # Check in ROOT
+            resume_pt = ROOT / args.resume
+        if resume_pt.exists():
+            print(f"\n🔄 RESUMING training from: {resume_pt}")
+            model_b = YOLO(str(resume_pt))
+
+            run_name = "stage2b_full"
+            run_dir  = ROOT / "runs" / "said" / run_name
+            common   = build_common_args(args.batch)
+
+            callbacks = make_callbacks(
+                args=args, run_dir=run_dir,
+                rtts_yaml=str(RTTS_YAML), vocfog_yaml=str(VOCFOG_YAML),
+                root=ROOT,
+            )
+            for event, fn in callbacks.items():
+                model_b.add_callback(event, fn)
+
+            model_b.train(
+                data     = str(RTTS_YAML),
+                epochs   = args.epochs,
+                batch    = args.batch,
+                device   = args.device,
+                project  = str(ROOT / "runs" / "said"),
+                name     = run_name,
+                exist_ok = True,
+                patience = 0,
+                resume   = True,
+                **{**common, "val": False},
+            )
+            print(f"\nStage 2 (resumed) complete.")
+            return
+        else:
+            print(f"  ⚠ Resume file not found: {args.resume}, starting fresh")
+
+    # ── Normal Stage 2 flow ───────────────────────────────────────────────
     if init_weights is None:
         init_weights = str(STAGE1_WEIGHTS) if STAGE1_WEIGHTS.exists() else "yolo11x.pt"
     print(f"\nInitialising Stage 2 from: {init_weights}")
@@ -309,6 +384,7 @@ def stage2_rtts(args, paths, init_weights: str = None):
         workers      = 4,
         val          = True,
         save         = True,
+        save_period  = 10,
         plots        = True,
         verbose      = True,
     )
@@ -316,15 +392,15 @@ def stage2_rtts(args, paths, init_weights: str = None):
     # Ultralytics may append -N suffix (stage2a_freeze-2, etc.)
     phase2a_best = ROOT / "runs" / "said" / "stage2a_freeze" / "weights" / "best.pt"
     if not phase2a_best.exists():
-        # Search for any stage2a_freeze* directory
-        import glob
         candidates = sorted(glob.glob(str(ROOT / "runs" / "said" / "stage2a_freeze*" / "weights" / "best.pt")))
         if candidates:
-            phase2a_best = Path(candidates[-1])  # use the latest
+            phase2a_best = Path(candidates[-1])
             print(f"  Found phase2a best at: {phase2a_best}")
         else:
             print(f"  Warning: phase2a best not found, using {init_weights}")
             phase2a_best = Path(init_weights)
+
+    publish_weights(phase2a_best, "said_stage2a_best.pt", ROOT)
 
     # ── Phase 2b: Full fine-tune with custom callbacks ─────────────────────
     print("\n[Phase 2b] Full fine-tune on RTTS with custom eval schedule")
@@ -335,10 +411,9 @@ def stage2_rtts(args, paths, init_weights: str = None):
     model_b = YOLO(str(phase2a_best))
 
     callbacks = make_callbacks(
-        args       = args,
-        run_dir    = run_dir,
-        rtts_yaml  = str(RTTS_YAML),
-        vocfog_yaml= str(VOCFOG_YAML),
+        args=args, run_dir=run_dir,
+        rtts_yaml=str(RTTS_YAML), vocfog_yaml=str(VOCFOG_YAML),
+        root=ROOT,
     )
     for event, fn in callbacks.items():
         model_b.add_callback(event, fn)
@@ -351,8 +426,8 @@ def stage2_rtts(args, paths, init_weights: str = None):
         project  = str(ROOT / "runs" / "said"),
         name     = run_name,
         exist_ok = True,
-        patience = 0,                   # we manage checkpoints via callbacks
-        **{**common, "val": False},    # disable default per-epoch val
+        patience = 0,
+        **{**common, "val": False},
     )
     print(f"\nStage 2 complete.")
 
@@ -362,11 +437,11 @@ def stage2_rtts(args, paths, init_weights: str = None):
 # ─────────────────────────────────────────────────────────────────────────────
 def validate(args, paths):
     ROOT, RTTS_YAML, VOCFOG_YAML, WEIGHTS_DIR, _ = paths
-    # Check multiple possible weight locations
     candidates = [
         args.weights,
         str(WEIGHTS_DIR / "said_rtts_final.pt"),
-        str(ROOT / "runs" / "weights" / "said_rtts_final.pt"),
+        str(ROOT / "said_final_best.pt"),
+        str(ROOT / "said_best.pt"),
         str(ROOT / "checkpoints" / "said_rolling_best.pt"),
         str(ROOT / "runs" / "said" / "stage2b_full" / "weights" / "best.pt"),
     ]
@@ -438,13 +513,15 @@ def parse_args():
     p.add_argument("--s1-epochs", type=int, default=50,
                    help="Stage 1 VOC-FOG pre-training epochs")
     p.add_argument("--batch",     type=int, default=None,
-                   help="Batch size (auto: 32 on Kaggle/CUDA, 16 local)")
+                   help="Batch size (default: 16)")
     p.add_argument("--device",    type=str, default=None,
                    help="Device: '0' (CUDA/P100), 'mps', 'cpu'. Auto-detected.")
     p.add_argument("--weights",   type=str, default=None,
                    help="Weights path for --stage validate")
+    p.add_argument("--resume",    type=str, default=None,
+                   help="Resume training from a saved .pt checkpoint")
     p.add_argument("--kaggle",    action="store_true",
-                   help="Force Kaggle mode (auto-detected if /kaggle/working exists)")
+                   help="Force Kaggle mode")
     p.add_argument("--val-freq",  type=int, default=10,
                    help="Validate every N epochs (default: 10)")
     p.add_argument("--test-freq", type=int, default=20,
@@ -459,11 +536,10 @@ def main():
     kaggle  = args.kaggle or IS_KAGGLE
     paths   = get_paths(kaggle)
 
-    # Auto-fill device and batch based on environment
     if args.device is None:
         args.device = auto_device()
     if args.batch is None:
-        args.batch = 16  # P100 16GB can't handle batch=32 with YOLO11x + augmentation
+        args.batch = 16
 
     print(f"\n{'═'*55}")
     print(f" SAID Training Configuration")
@@ -476,6 +552,8 @@ def main():
     print(f"  Val every   : {args.val_freq} epochs")
     print(f"  Test every  : {args.test_freq} epochs")
     print(f"  Save best   : every {args.save_freq} epochs")
+    if args.resume:
+        print(f"  Resume from : {args.resume}")
     print(f"{'═'*55}\n")
 
     if args.stage == "check":
