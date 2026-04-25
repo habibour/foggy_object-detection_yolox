@@ -35,6 +35,9 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
+# ── CUDA memory optimization (must be set BEFORE any torch.cuda calls) ────────
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # Import SAID integration (registers A2C2f-FSA + patches WIoU loss)
 import sys
 if '/kaggle/working' in sys.path or os.path.exists('/kaggle/working'):
@@ -82,14 +85,28 @@ def get_paths(kaggle: bool = False):
 # Hyperparameters
 # ─────────────────────────────────────────────────────────────────────────────
 def build_common_args(batch: int, workers: int = 4) -> dict:
+    """
+    Shared training hyperparameters.
+
+    Memory strategy for P100 (16GB):
+      - Physical batch = 4 (fits in VRAM with YOLO11x + augmentation)
+      - nbs = 64 (nominal batch size → gradient accumulated over 64/4 = 16 steps)
+      - This gives effective batch 64 with only 4 images per GPU forward pass
+
+    Stability:
+      - lr0 = 0.001 (conservative to prevent EMA NaN/Inf)
+      - warmup_epochs = 5.0 (longer warmup for stable gradient scaling)
+      - max_norm gradient clipping handled by ultralytics internally
+    """
     return dict(
         imgsz         = 640,
         optimizer     = "AdamW",
-        lr0           = 0.002,
+        lr0           = 0.001,       # conservative LR to prevent EMA NaN
         lrf           = 0.01,
         weight_decay  = 0.0005,
-        warmup_epochs = 3.0,
-        warmup_bias_lr= 0.1,
+        warmup_epochs = 5.0,         # longer warmup for gradient stability
+        warmup_bias_lr= 0.01,        # lower bias warmup LR
+        nbs           = 64,          # nominal batch size → grad accum = 64/batch
         hsv_h         = 0.015,
         hsv_s         = 0.7,
         hsv_v         = 0.4,
@@ -104,7 +121,7 @@ def build_common_args(batch: int, workers: int = 4) -> dict:
         shear         = 0.0,
         perspective   = 0.0,
         close_mosaic  = 10,
-        amp           = True,
+        amp           = True,        # FP16 mixed precision
         workers       = workers,
         plots         = True,
         verbose       = True,
@@ -130,6 +147,45 @@ def publish_weights(src: Path, name: str, root: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 # Callback Factory for Stage 2
 # ─────────────────────────────────────────────────────────────────────────────
+def make_stability_callbacks(run_dir: Path, root: Path):
+    """
+    Callbacks for gradient clipping and forced first-epoch checkpoint.
+    Prevents EMA NaN/Inf and ensures diagnostic checkpoint is always available.
+    """
+    import torch
+
+    def on_train_batch_end(trainer):
+        """Apply gradient clipping after each batch to prevent NaN gradients."""
+        if trainer.model is not None and trainer.model.parameters():
+            torch.nn.utils.clip_grad_norm_(
+                trainer.model.parameters(), max_norm=10.0
+            )
+
+    def on_fit_epoch_end_stability(trainer):
+        """Force-save epoch 1 checkpoint regardless of EMA status."""
+        epoch = trainer.epoch + 1
+        if epoch == 1:
+            save_dir = Path(trainer.save_dir) / "weights"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_path = save_dir / "epoch1_diagnostic.pt"
+            try:
+                # Save model state dict directly (bypasses EMA check)
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': trainer.model.state_dict(),
+                    'optimizer_state_dict': trainer.optimizer.state_dict() if trainer.optimizer else None,
+                }, str(ckpt_path))
+                print(f"  💾 Epoch 1 diagnostic checkpoint saved: {ckpt_path.name}")
+                publish_weights(ckpt_path, "said_epoch1_diagnostic.pt", root)
+            except Exception as e:
+                print(f"  ⚠ Epoch 1 save failed: {e}")
+
+    return {
+        "on_train_batch_end": on_train_batch_end,
+        "on_fit_epoch_end": on_fit_epoch_end_stability,
+    }
+
+
 def make_callbacks(args, run_dir: Path, rtts_yaml: str, vocfog_yaml: str, root: Path):
     """
     Custom eval + checkpoint callbacks for Stage 2.
@@ -299,6 +355,13 @@ def stage1_vocfog(args, paths):
     model = YOLO(yaml_path)
     print(f"  SAID model: {sum(p.numel() for p in model.model.parameters()):,} params")
 
+    # Attach stability callbacks (gradient clipping + epoch-1 diagnostic save)
+    stab_cbs = make_stability_callbacks(
+        run_dir=ROOT / "runs" / "said" / "stage1_vocfog", root=ROOT
+    )
+    for event, fn in stab_cbs.items():
+        model.add_callback(event, fn)
+
     results = model.train(
         data    = str(VOCFOG_YAML),
         epochs  = args.s1_epochs,
@@ -392,10 +455,11 @@ def stage2_rtts(args, paths, init_weights: str = None):
         name         = "stage2a_freeze",
         exist_ok     = True,
         freeze       = list(range(10)),
-        lr0          = 0.001,
+        lr0          = 0.0005,
         lrf          = 0.1,
         weight_decay = 0.0005,
-        warmup_epochs= 1.0,
+        warmup_epochs= 2.0,
+        nbs          = 64,
         imgsz        = 640,
         optimizer    = "AdamW",
         mosaic       = 0.8,
@@ -435,6 +499,11 @@ def stage2_rtts(args, paths, init_weights: str = None):
         root=ROOT,
     )
     for event, fn in callbacks.items():
+        model_b.add_callback(event, fn)
+
+    # Stability callbacks (gradient clipping + epoch-1 save)
+    stab_cbs = make_stability_callbacks(run_dir=run_dir, root=ROOT)
+    for event, fn in stab_cbs.items():
         model_b.add_callback(event, fn)
 
     model_b.train(
@@ -532,7 +601,7 @@ def parse_args():
     p.add_argument("--s1-epochs", type=int, default=50,
                    help="Stage 1 VOC-FOG pre-training epochs")
     p.add_argument("--batch",     type=int, default=None,
-                   help="Batch size (default: 16)")
+                   help="Physical batch size (default: 4, effective 64 via grad accum)")
     p.add_argument("--device",    type=str, default=None,
                    help="Device: '0' (CUDA/P100), 'mps', 'cpu'. Auto-detected.")
     p.add_argument("--weights",   type=str, default=None,
@@ -558,14 +627,15 @@ def main():
     if args.device is None:
         args.device = auto_device()
     if args.batch is None:
-        args.batch = 16
+        args.batch = 4  # physical batch; effective = nbs(64) via grad accumulation
 
     print(f"\n{'═'*55}")
     print(f" SAID Training Configuration")
     print(f"{'═'*55}")
     print(f"  Environment : {'Kaggle P100' if kaggle else 'Local'}")
     print(f"  Device      : {args.device}")
-    print(f"  Batch size  : {args.batch}")
+    print(f"  Batch (phys): {args.batch}")
+    print(f"  Batch (eff) : 64 (nbs=64, accum={64//max(args.batch,1)} steps)")
     print(f"  Stage       : {args.stage}")
     print(f"  Epochs (S2) : {args.epochs}")
     print(f"  Val every   : {args.val_freq} epochs")
