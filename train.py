@@ -35,6 +35,12 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
+# Import SAID integration (registers A2C2f-FSA + patches WIoU loss)
+import sys
+if '/kaggle/working' in sys.path or os.path.exists('/kaggle/working'):
+    sys.path.insert(0, '/kaggle/working')
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment Detection
@@ -285,7 +291,14 @@ def stage1_vocfog(args, paths):
     print("=" * 55)
 
     common = build_common_args(args.batch)
-    model  = YOLO("yolo11x.pt")
+
+    # Build SAID model: YOLO11x + A2C2f-FSA fog suppression
+    from said.integrate import create_said_yaml, register_a2c2f_fsa
+    register_a2c2f_fsa()
+    yaml_path = create_said_yaml(str(ROOT / "said_yolo11x.yaml"))
+    model = YOLO(yaml_path)
+    print(f"  SAID model: {sum(p.numel() for p in model.model.parameters()):,} params")
+
     results = model.train(
         data    = str(VOCFOG_YAML),
         epochs  = args.s1_epochs,
@@ -354,7 +367,13 @@ def stage2_rtts(args, paths, init_weights: str = None):
 
     # ── Normal Stage 2 flow ───────────────────────────────────────────────
     if init_weights is None:
-        init_weights = str(STAGE1_WEIGHTS) if STAGE1_WEIGHTS.exists() else "yolo11x.pt"
+        if STAGE1_WEIGHTS.exists():
+            init_weights = str(STAGE1_WEIGHTS)
+        else:
+            # Build SAID model from scratch if no Stage 1 weights
+            from said.integrate import create_said_yaml, register_a2c2f_fsa
+            register_a2c2f_fsa()
+            init_weights = create_said_yaml(str(ROOT / "said_yolo11x.yaml"))
     print(f"\nInitialising Stage 2 from: {init_weights}")
 
     print("\n" + "=" * 55)
@@ -555,6 +574,15 @@ def main():
     if args.resume:
         print(f"  Resume from : {args.resume}")
     print(f"{'═'*55}\n")
+
+    # ── Activate SAID integration: A2C2f-FSA + WIoU loss ──────────────────
+    if args.stage != "check":
+        try:
+            from said.integrate import setup_said
+            setup_said()
+        except ImportError as e:
+            print(f"  ⚠ SAID integration not available: {e}")
+            print(f"    Training will use standard YOLO11 architecture + CIoU loss")
 
     if args.stage == "check":
         sanity_check()

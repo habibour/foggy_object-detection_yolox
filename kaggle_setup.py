@@ -66,4 +66,10 @@ loss = lf(torch.tensor([[10.,10.,50.,50.]]), torch.tensor([[12.,12.,52.,52.]]))
 assert loss.item() >= 0
 print('WIoU_v3_InnerMPDIoU OK')
 
-print('\nSetup complete. Run training cells below.')
+# ── 5. Verify SAID integration ────────────────────────────────────────────────
+from said.integrate import setup_said, create_said_yaml
+setup_said()
+yaml_path = create_said_yaml(str(WORK / 'said_yolo11x.yaml'))
+print(f'SAID YAML: {yaml_path}')
+
+print('\nSetup complete. SAID modules integrated. Run training cells below.')
